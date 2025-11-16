@@ -1,0 +1,28 @@
+﻿@inherits LayoutComponentBase
+
+<NavMenu />
+
+@if (!string.IsNullOrEmpty(logoutMessage))
+{
+    <div class="logout-banner">
+        @logoutMessage
+    </div>
+}
+
+<main>
+    <article class="content px-4">
+        @Body
+    </article>
+</main>
+
+@code {
+    private string? logoutMessage;
+
+    [JSInvokable]
+    public Task ShowLogoutMessage(string message)
+    {
+        logoutMessage = message;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+}

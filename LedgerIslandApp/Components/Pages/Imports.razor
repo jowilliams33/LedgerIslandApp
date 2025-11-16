@@ -1,0 +1,201 @@
+﻿@page "/imports"
+@using System.ComponentModel.DataAnnotations
+@using LedgerIslandApp.Models
+@using LedgerIslandApp.Services
+@using Microsoft.AspNetCore.WebUtilities
+@inject NavigationManager Nav
+
+
+<PageTitle>Imports</PageTitle>
+
+<div class="container py-4">
+    <h4 class="fw-bold mb-3 text-primary">Imports</h4>
+
+    <div class="d-flex gap-2 align-items-center mb-2">
+        <span class="text-muted small">Batch:</span>
+        <code>@(CurrentBatchId == Guid.Empty ? "(none)" : CurrentBatchId)</code>
+
+        <button class="btn btn-primary btn-sm ms-3" @onclick="RunValidation" disabled="@IsBusy || CurrentBatchId == Guid.Empty">
+            @if (IsBusy)
+            {
+                <span class="spinner-border spinner-border-sm me-2"></span>
+            }
+            Run Validation
+        </button>
+
+        <button class="btn btn-success btn-sm" @onclick="PostNow" disabled="@IsBusy || CurrentBatchId == Guid.Empty">
+            Post to Golden
+        </button>
+
+        @if (Issues is not null)
+        {
+            <button class="btn btn-outline-secondary btn-sm" @onclick="DownloadIssues" disabled="@((Issues?.Count ?? 0) == 0)">
+                Download Issues (CSV)
+            </button>
+            <span class="ms-2 small text-muted">(@Issues.Count issues)</span>
+        }
+    </div>
+
+    @if (LastPost is not null)
+    {
+        <div class="alert alert-info py-2">
+            <strong>Last Post:</strong>
+            @LastPost.ApprovedBy
+            <span class="text-muted"> @LastPost.PostedAtUtc.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")</span>
+            · run+@LastPost.RunRows · total=@LastPost.TotalRows
+        </div>
+    }
+
+    @if (Totals is not null)
+    {
+        var balanced = Totals.TotalDebit == Totals.TotalCredit;
+        <div class="alert @(balanced ? "alert-success" : "alert-danger") mt-3 mb-2">
+            <strong>Totals:</strong>
+            Debit = @Totals.TotalDebit:N2 · Credit = @Totals.TotalCredit:N2 · Rows = @Totals.RowCount
+            @if (!balanced)
+            {
+                <span class="ms-2 badge bg-danger">
+                    Unbalanced: @(Totals.TotalDebit - Totals.TotalCredit):N2
+                </span>
+            }
+            @if (Totals.MissingAmountRows > 0)
+            {
+                <span class="ms-2 badge bg-warning">
+                    Missing Amount: @Totals.MissingAmountRows
+                </span>
+            }
+            @if (Totals.BothSidesRows > 0)
+            {
+                <span class="ms-2 badge bg-warning">
+                    Both Debit+Credit: @Totals.BothSidesRows
+                </span>
+            }
+        </div>
+    }
+
+    @if (Issues is null)
+    {
+        <div class="alert alert-warning mt-3">
+            Provide a batch id, e.g. <code>/imports?batch=11111111-1111-1111-1111-111111111111</code>
+        </div>
+    }
+    else if (Issues.Count == 0)
+    {
+        <div class="alert alert-success mt-3">No validation issues found.</div>
+    }
+    else
+    {
+        <div class="table-responsive mt-3">
+            <table class="table table-sm table-striped align-middle">
+                <thead class="table-light">
+                    <tr>
+                        <th>CleanRowId</th>
+                        <th>Severity</th>
+                        <th>Code</th>
+                        <th>Field</th>
+                        <th>Message</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var i in Issues)
+                    {
+                        <tr class="@GetSeverityClass(i.Severity)">
+                            <td>@i.CleanRowId</td>
+                            <td>@i.Severity</td>
+                            <td>@i.Code</td>
+                            <td>@i.Field</td>
+                            <td>@i.Message</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+</div>
+
+@code {
+    private Guid CurrentBatchId;
+    private bool IsBusy;
+    private List<RowIssueDto>? Issues;
+    private BatchTotalsDto? Totals;
+    private PostAuditDto? LastPost;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var uri = Nav.ToAbsoluteUri(Nav.Uri);
+        if (QueryHelpers.ParseQuery(uri.Query).TryGetValue("batch", out var raw)
+            && Guid.TryParse(raw, out var id))
+        {
+            CurrentBatchId = id;
+            await RunValidation();
+            LastPost = await Validation.GetLastPostAsync(CurrentBatchId);
+        }
+    }
+
+    private async Task RunValidation()
+    {
+        if (CurrentBatchId == Guid.Empty) return;
+        IsBusy = true; StateHasChanged();
+
+        try
+        {
+            Issues = (await Validation.GetIssuesAsync(CurrentBatchId)).ToList();
+            Totals = await Validation.GetTotalsAsync(CurrentBatchId);
+            LastPost = await Validation.GetLastPostAsync(CurrentBatchId);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex);
+        }
+        finally
+        {
+            IsBusy = false; StateHasChanged();
+        }
+    }
+
+    private async Task PostNow()
+    {
+        if (CurrentBatchId == Guid.Empty) return;
+        IsBusy = true; StateHasChanged();
+
+        try
+        {
+            var rows = await Validation.PostToGoldenAsync(CurrentBatchId, "system");
+            Totals = await Validation.GetTotalsAsync(CurrentBatchId);
+            Issues = (await Validation.GetIssuesAsync(CurrentBatchId)).ToList();
+            LastPost = await Validation.GetLastPostAsync(CurrentBatchId);
+            Console.WriteLine($"Posted {rows} rows.");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex);
+        }
+        finally
+        {
+            IsBusy = false; StateHasChanged();
+        }
+    }
+
+    private async Task DownloadIssues()
+    {
+        if (Issues is null || Issues.Count == 0) return;
+
+        var csv = new StringBuilder();
+        csv.AppendLine("CleanRowId,Severity,Code,Field,Message");
+        foreach (var i in Issues)
+            csv.AppendLine($"{i.CleanRowId},{i.Severity},{i.Code},{i.Field},{i.Message}");
+
+        var bytes = Encoding.UTF8.GetBytes(csv.ToString());
+        var base64 = Convert.ToBase64String(bytes);
+        var url = $"data:text/csv;base64,{base64}";
+        await JSRuntime.InvokeVoidAsync("window.open", url, "_blank");
+    }
+
+    private string GetSeverityClass(string sev) =>
+        sev?.ToLower() switch
+        {
+            "error" => "table-danger",
+            "warn" => "table-warning",
+            _ => ""
+        };
+}

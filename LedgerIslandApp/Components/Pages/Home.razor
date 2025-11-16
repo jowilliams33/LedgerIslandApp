@@ -1,0 +1,162 @@
+﻿@page "/"
+@using System.ComponentModel.DataAnnotations
+@using LedgerIslandApp.Models
+@using LedgerIslandApp.Models.Auth
+@using LedgerIslandApp.Services
+@using Microsoft.AspNetCore.Http
+@inject NavigationManager Nav
+@inject ISessionService SessionService
+@inject IConfiguration Config
+@inject IHttpContextAccessor HttpCtx
+
+<PageTitle>Login</PageTitle>
+
+<div class="container py-5">
+    <div class="row justify-content-center">
+        <div class="col-12 col-md-6 col-lg-4">
+            <div class="card shadow rounded-4 border-0">
+                <div class="card-body p-4">
+                    @* <h3 class="text-center mb-4 fw-bold text-primary">LedgerIsland</h3> *@
+                    
+                    @if (!string.IsNullOrWhiteSpace(validationError))
+                    {
+                        <div class="alert alert-danger py-2 small" role="alert">@validationError</div>
+                    }
+
+                    <EditForm Model="@model" OnValidSubmit="HandleLoginAsync">
+                        <DataAnnotationsValidator />
+                        <ValidationSummary />
+
+                        <div class="mb-3">
+                            <label class="form-label small text-muted">Email</label>
+                            <InputText @bind-Value="model.Email" class="form-control rounded-3" />
+                            <ValidationMessage For="@(() => model.Email)" />
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label small text-muted">Password</label>
+                            <InputText @bind-Value="model.Password" type="password" class="form-control rounded-3" />
+                            <ValidationMessage For="@(() => model.Password)" />
+                        </div>
+
+                        <button type="submit" class="btn btn-primary w-100 rounded-3 shadow-sm">
+                            Login
+                        </button>
+                    </EditForm>
+
+                    <div class="text-center my-3">
+                        <span class="text-muted small">or</span>
+                    </div>
+
+                    <a class="btn btn-light w-100 d-flex align-items-center justify-content-center border rounded-3 shadow-sm"
+                       href="/login" data-enhance-nav="false">
+
+                        <img src="https://developers.google.com/identity/images/g-logo.png"
+                             alt="Google logo"
+                             style="width:20px;height:20px;margin-right:8px;" />
+                        <span class="fw-semibold">Sign in with Google</span>
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+@code {
+    private LoginModel model = new();
+    private string? validationError;
+
+    private async Task HandleLoginAsync()
+    {
+        validationError = null;
+
+        // Fake auth (replace later)
+        var ok = model.Email.Equals("admin@ledgerisland.com", StringComparison.OrdinalIgnoreCase)
+                 && model.Password == "password";
+
+        // Grab context info once
+        var ctx = HttpCtx.HttpContext!;
+        var ua = ctx.Request.Headers.UserAgent.ToString();
+        var ip = ctx.Connection.RemoteIpAddress?.ToString();
+        if (!ok)
+        {
+            var ctx2 = HttpCtx.HttpContext!;
+            var ua2 = ctx2.Request.Headers.UserAgent.ToString();
+            var ip2 = ctx2.Connection.RemoteIpAddress?.ToString();
+
+            await SessionService.AuditAsync(new LoginAudit
+            {
+                UserId = model.Email,
+                Provider = "local",
+                LoggedAt = DateTime.UtcNow,
+                IpAddress = ip,
+                UserAgent = ua,
+                Success = true
+            }, ctx.RequestAborted);
+
+            validationError = "Invalid credentials.";
+            return;
+        }
+
+
+        try
+        {
+            // Create app session (invalidate others, 12h)
+            var (sessionId, rawToken) = await SessionService.CreateAsync(
+                userId: model.Email,
+                ua: ua,
+                ip: ip,
+                invalidateOthers: true,
+                ttl: TimeSpan.FromHours(12),
+                ct: ctx.RequestAborted);
+
+            // sid cookie (HttpOnly)
+            ctx.Response.Cookies.Append("sid", rawToken, new CookieOptions
+            {
+                HttpOnly = true,
+                Secure = true,
+                SameSite = SameSiteMode.Lax,
+                Expires = DateTimeOffset.UtcNow.AddHours(12)
+            });
+
+            // control key + session id (readable by JS)
+            var secret = Config["Auth:ControlSecret"]!;
+            var ctl = ControlKey.Make(secret, sessionId);
+
+            ctx.Response.Cookies.Append("ctl", ctl, new CookieOptions
+            {
+                HttpOnly = false,
+                Secure = true,
+                SameSite = SameSiteMode.Lax,
+                Expires = DateTimeOffset.UtcNow.AddHours(12)
+            });
+
+            ctx.Response.Cookies.Append("sid_id", sessionId.ToString("N"), new CookieOptions
+            {
+                HttpOnly = false,
+                Secure = true,
+                SameSite = SameSiteMode.Lax,
+                Expires = DateTimeOffset.UtcNow.AddHours(12)
+            });
+
+            // Audit success
+            await SessionService.AuditAsync(new LoginAudit
+            {
+                UserId = model.Email,
+                Provider = "local",
+                LoggedAt = DateTime.UtcNow,
+                IpAddress = ip,
+                UserAgent = ua,
+                Success = true
+            }, ctx.RequestAborted);
+
+            Nav.NavigateTo("imports", forceLoad: true);
+        }
+        catch (Exception ex)
+        {
+            validationError = $"Login failed. {ex.Message}";
+        }
+    }
+
+}

@@ -1,0 +1,40 @@
+﻿@page "/upload"
+@using Microsoft.AspNetCore.Components.Forms
+
+<h3>Upload Files</h3>
+
+<div class="file-drop-zone @HoverClass"
+     @ondragenter="OnDragEnter"
+     @ondragleave="OnDragLeave"
+     @ondragover="OnDragEnter">
+
+    <InputFile @key="@fileInputKey"
+               OnChange="HandleFiles"
+               multiple
+               accept=".csv,application/pdf" />
+</div>
+
+@if (selectedFiles is not null)
+{
+    <ul>
+        @foreach (var file in selectedFiles)
+        {
+            <li>@file.Name (@(file.Size / 1024) KB)</li>
+        }
+    </ul>
+}
+
+@code {
+    private IReadOnlyList<IBrowserFile>? selectedFiles;
+    private string HoverClass = string.Empty;
+    private string fileInputKey = Guid.NewGuid().ToString();
+
+    void OnDragEnter(DragEventArgs e) => HoverClass = "hover";
+    void OnDragLeave(DragEventArgs e) => HoverClass = string.Empty;
+
+    void HandleFiles(InputFileChangeEventArgs e)
+    {
+        selectedFiles = e.GetMultipleFiles(20); // allow up to 20
+        fileInputKey = Guid.NewGuid().ToString(); // reset so same file can be re-picked
+    }
+}

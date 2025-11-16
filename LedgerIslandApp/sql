@@ -1,0 +1,260 @@
+/* =====================================================================
+   LedgerIsland — End-to-End Validation Setup (RERUNNABLE)
+   Creates schemas, minimal tables, indexes, and validation procs.
+   ===================================================================== */
+
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+/* -----------------------
+   0) Schemas
+   ----------------------- */
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'li')
+    EXEC ('CREATE SCHEMA li');
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'val')
+    EXEC ('CREATE SCHEMA val');
+GO
+
+/* -----------------------
+   1) DROP (in dependency-safe order)
+   ----------------------- */
+IF OBJECT_ID('val.GetIssuesForBatch', 'P') IS NOT NULL DROP PROCEDURE val.GetIssuesForBatch;
+IF OBJECT_ID('val.PopulateIssuesForBatch', 'P') IS NOT NULL DROP PROCEDURE val.PopulateIssuesForBatch;
+GO
+
+IF OBJECT_ID('li.RowIssues', 'U') IS NOT NULL DROP TABLE li.RowIssues;
+IF OBJECT_ID('li.RowsClean', 'U') IS NOT NULL DROP TABLE li.RowsClean;
+IF OBJECT_ID('li.ChartOfAccounts', 'U') IS NOT NULL DROP TABLE li.ChartOfAccounts;
+
+/* Minimal stubs to satisfy foreign key-able references (and to be useful elsewhere) */
+IF OBJECT_ID('li.RowsRaw', 'U') IS NOT NULL DROP TABLE li.RowsRaw;
+IF OBJECT_ID('li.UploadBatch', 'U') IS NOT NULL DROP TABLE li.UploadBatch;
+GO
+
+/* -----------------------
+   2) Core reference / stubs
+   ----------------------- */
+
+-- Batch table (minimal)
+CREATE TABLE li.UploadBatch
+(
+    BatchId      UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_li_UploadBatch PRIMARY KEY,
+    SourceFile   NVARCHAR(260) NULL,
+    UploadedBy   NVARCHAR(128) NULL,
+    Status       NVARCHAR(32)  NULL,
+    CreatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_li_UploadBatch_Created DEFAULT SYSUTCDATETIME()
+);
+GO
+
+-- Raw rows (optional traceability)
+CREATE TABLE li.RowsRaw
+(
+    RowId        BIGINT IDENTITY(1,1) PRIMARY KEY,
+    BatchId      UNIQUEIDENTIFIER NOT NULL,
+    RawPayload   NVARCHAR(MAX) NULL,
+    CreatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_li_RowsRaw_Created DEFAULT SYSUTCDATETIME()
+);
+GO
+CREATE INDEX IX_li_RowsRaw_Batch ON li.RowsRaw(BatchId);
+GO
+
+-- Chart of Accounts
+CREATE TABLE li.ChartOfAccounts
+(
+    AccountId   INT IDENTITY(1,1) PRIMARY KEY,
+    AccountCode NVARCHAR(100) NOT NULL UNIQUE,
+    AccountName NVARCHAR(200) NULL,
+    AccountType NVARCHAR(50)  NULL
+);
+GO
+
+/* -----------------------
+   3) Clean rows (normalized)
+   ----------------------- */
+CREATE TABLE li.RowsClean
+(
+    CleanId      BIGINT IDENTITY(1,1) PRIMARY KEY,
+    BatchId      UNIQUEIDENTIFIER NOT NULL,
+    RowId        BIGINT NULL,                        -- optional link to RowsRaw
+    AccountCode  NVARCHAR(100) NULL,
+    AccountId    INT NULL,                           -- if resolved
+    TxnDate      DATE NULL,
+    PostedDate   DATE NULL,
+    Debit        DECIMAL(18,2) NULL,
+    Credit       DECIMAL(18,2) NULL,
+    Amount       DECIMAL(18,2) NULL,                 -- optional unified amount (not required by checks)
+    EntryHash    VARBINARY(32) NULL,                 -- e.g., SHA-256 of natural key
+    CreatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_li_RowsClean_Created DEFAULT SYSUTCDATETIME()
+);
+GO
+
+CREATE INDEX IX_li_RowsClean_Batch      ON li.RowsClean(BatchId);
+CREATE INDEX IX_li_RowsClean_EntryHash  ON li.RowsClean(EntryHash);
+CREATE INDEX IX_li_RowsClean_Account    ON li.RowsClean(AccountCode);
+GO
+
+/* -----------------------
+   4) RowIssues (validation messages)
+   ----------------------- */
+CREATE TABLE li.RowIssues
+(
+    IssueId      BIGINT IDENTITY(1,1) PRIMARY KEY,
+    BatchId      UNIQUEIDENTIFIER NOT NULL,
+    CleanId      BIGINT NULL,          -- li.RowsClean.CleanId (nullable for batch-level issues)
+    RowId        BIGINT NULL,          -- li.RowsRaw.RowId    (nullable)
+    Severity     TINYINT NOT NULL,     -- 1=Info, 2=Warning, 3=Error
+    Code         NVARCHAR(64) NOT NULL,
+    Field        NVARCHAR(128) NULL,
+    Message      NVARCHAR(2000) NOT NULL,
+    CreatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_li_RowIssues_Created DEFAULT SYSUTCDATETIME()
+);
+GO
+
+CREATE INDEX IX_li_RowIssues_Batch    ON li.RowIssues(BatchId);
+CREATE INDEX IX_li_RowIssues_Severity ON li.RowIssues(Severity);
+GO
+
+/* (Optional) FKs — safe to add now that all tables exist */
+ALTER TABLE li.RowsClean  WITH NOCHECK ADD CONSTRAINT FK_li_RowsClean_Batch  FOREIGN KEY (BatchId) REFERENCES li.UploadBatch(BatchId);
+ALTER TABLE li.RowsClean  WITH NOCHECK ADD CONSTRAINT FK_li_RowsClean_Raw    FOREIGN KEY (RowId)   REFERENCES li.RowsRaw(RowId);
+ALTER TABLE li.RowIssues  WITH NOCHECK ADD CONSTRAINT FK_li_RowIssues_Batch  FOREIGN KEY (BatchId) REFERENCES li.UploadBatch(BatchId);
+ALTER TABLE li.RowIssues  WITH NOCHECK ADD CONSTRAINT FK_li_RowIssues_Clean  FOREIGN KEY (CleanId) REFERENCES li.RowsClean(CleanId);
+ALTER TABLE li.RowIssues  WITH NOCHECK ADD CONSTRAINT FK_li_RowIssues_Raw    FOREIGN KEY (RowId)   REFERENCES li.RowsRaw(RowId);
+GO
+
+/* -----------------------
+   5) Validation procedure — PopulateIssuesForBatch
+   ----------------------- */
+CREATE OR ALTER PROCEDURE val.PopulateIssuesForBatch
+    @BatchId UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Reset issues for this batch (idempotent re-run)
+    DELETE FROM li.RowIssues WHERE BatchId = @BatchId;
+
+    /* 5.1 Required field checks */
+    -- Missing AccountCode
+    INSERT INTO li.RowIssues (BatchId, CleanId, RowId, Severity, Code, Field, Message, CreatedAtUtc)
+    SELECT r.BatchId, r.CleanId, r.RowId, 3, 'MISSING_FIELD', 'AccountCode',
+           N'Missing required AccountCode.', SYSUTCDATETIME()
+    FROM li.RowsClean r
+    WHERE r.BatchId = @BatchId
+      AND (r.AccountCode IS NULL OR LTRIM(RTRIM(r.AccountCode)) = N'');
+
+    -- Missing amount: neither Debit nor Credit provided
+    INSERT INTO li.RowIssues (BatchId, CleanId, RowId, Severity, Code, Field, Message, CreatedAtUtc)
+    SELECT r.BatchId, r.CleanId, r.RowId, 3, 'MISSING_FIELD', 'Amount',
+           N'Missing transaction amount (no Debit or Credit).', SYSUTCDATETIME()
+    FROM li.RowsClean r
+    WHERE r.BatchId = @BatchId
+      AND r.Debit IS NULL AND r.Credit IS NULL;
+
+    -- Both Debit and Credit present (invalid)
+    INSERT INTO li.RowIssues (BatchId, CleanId, RowId, Severity, Code, Field, Message, CreatedAtUtc)
+    SELECT r.BatchId, r.CleanId, r.RowId, 3, 'INVALID_VALUE', 'Amount',
+           N'Both Debit and Credit are provided; only one is allowed per row.', SYSUTCDATETIME()
+    FROM li.RowsClean r
+    WHERE r.BatchId = @BatchId
+      AND r.Debit IS NOT NULL AND r.Credit IS NOT NULL;
+
+    /* 5.2 Unknown account codes (AccountCode present but not in ChartOfAccounts) */
+    INSERT INTO li.RowIssues (BatchId, CleanId, RowId, Severity, Code, Field, Message, CreatedAtUtc)
+    SELECT r.BatchId, r.CleanId, r.RowId, 3, 'UNKNOWN_ACCOUNT', 'AccountCode',
+           N'Account code "' + COALESCE(r.AccountCode, N'(null)') + N'" not found in ChartOfAccounts.', SYSUTCDATETIME()
+    FROM li.RowsClean r
+    LEFT JOIN li.ChartOfAccounts a
+           ON a.AccountCode = r.AccountCode
+    WHERE r.BatchId = @BatchId
+      AND (r.AccountCode IS NOT NULL AND LTRIM(RTRIM(r.AccountCode)) <> N'')
+      AND a.AccountId IS NULL;
+
+    /* 5.3 Duplicate entries within batch via EntryHash */
+    INSERT INTO li.RowIssues (BatchId, CleanId, RowId, Severity, Code, Field, Message, CreatedAtUtc)
+    SELECT r.BatchId, r.CleanId, r.RowId, 3, 'DUPLICATE_ENTRY', NULL,
+           N'Duplicate entry detected for EntryHash ' +
+           CASE WHEN r.EntryHash IS NULL THEN N'(null)'
+                ELSE N'0x' + LOWER(CONVERT(NVARCHAR(64), r.EntryHash, 2))
+           END + N'.',
+           SYSUTCDATETIME()
+    FROM li.RowsClean r
+    WHERE r.BatchId = @BatchId
+      AND r.EntryHash IS NOT NULL
+      AND EXISTS
+          (SELECT 1
+           FROM li.RowsClean r2
+           WHERE r2.BatchId = r.BatchId
+             AND r2.EntryHash = r.EntryHash
+             AND r2.CleanId <> r.CleanId);
+
+    /* 5.4 Trial balance check (sum Debit vs Credit) */
+    DECLARE @total_debit  DECIMAL(38,4) = 0,
+            @total_credit DECIMAL(38,4) = 0;
+
+    SELECT
+        @total_debit  = SUM(COALESCE(r.Debit,  0)),
+        @total_credit = SUM(COALESCE(r.Credit, 0))
+    FROM li.RowsClean r
+    WHERE r.BatchId = @BatchId;
+
+    IF (@total_debit <> @total_credit)
+    BEGIN
+        INSERT INTO li.RowIssues (BatchId, CleanId, RowId, Severity, Code, Field, Message, CreatedAtUtc)
+        VALUES
+        (
+            @BatchId, NULL, NULL, 3, 'TRIAL_BALANCE_ERROR', NULL,
+            N'Batch is out of balance: total Debit = ' + CONVERT(NVARCHAR(50), @total_debit)
+            + N', total Credit = ' + CONVERT(NVARCHAR(50), @total_credit) + N'.',
+            SYSUTCDATETIME()
+        );
+    END
+END
+GO
+
+/* -----------------------
+   6) Retrieval procedure — DTO-friendly
+       Matches: CleanRowId, Severity, Code, Field, Message
+   ----------------------- */
+CREATE OR ALTER PROCEDURE val.GetIssuesForBatch
+    @BatchId UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        ISNULL(CleanId, 0)                                                   AS CleanRowId,
+        CASE Severity WHEN 1 THEN N'Info' WHEN 2 THEN N'Warning' WHEN 3 THEN N'Error' ELSE N'Unknown' END
+                                                                              AS Severity,
+        Code                                                                  AS Code,
+        Field                                                                 AS Field,
+        Message                                                               AS Message
+    FROM li.RowIssues
+    WHERE BatchId = @BatchId
+    ORDER BY
+        CASE WHEN CleanId IS NULL THEN -1 ELSE 0 END,  -- batch-level first
+        ISNULL(CleanId, 0),
+        IssueId;
+END
+GO
+
+/* -----------------------
+   7) Quick sanity demo (comment out if not needed)
+   ----------------------- */
+/*
+DECLARE @b UNIQUEIDENTIFIER = NEWID();
+INSERT li.UploadBatch (BatchId, SourceFile, UploadedBy, Status) VALUES (@b, N'demo.csv', N'you', N'Loaded');
+
+-- CoA
+INSERT li.ChartOfAccounts (AccountCode, AccountName) VALUES (N'1000', N'Cash'), (N'2000', N'AP');
+
+-- Clean rows (one missing account, one duplicate hash, and imbalance)
+INSERT li.RowsClean (BatchId, AccountCode, Debit, Credit, EntryHash) VALUES
+(@b, N'1000', 100.00, NULL, 0x010203),     -- ok
+(@b, N'9999', NULL,  50.00, 0xA1A2A3),     -- unknown account
+(@b, NULL,   NULL,  NULL,  NULL),          -- missing account + amount
+(@b, N'1000', 25.00, NULL,  0x010203);     -- duplicate hash with first row
+
+EXEC val.PopulateIssuesForBatch @BatchId = @b;
+EXEC val.GetIssuesForBatch      @BatchId = @b;
+*/
