@@ -8,7 +8,7 @@ using Microsoft.EntityFrameworkCore;
 using System.Security.Cryptography;
 using System.Text;
 
-public sealed class SessionService(AppDbContext db, IHubContext<SyncHub> hub) : ISessionService
+public sealed class SessionService(AppDbContext db, IHubContext<SyncHub> hub) 
 {
     static byte[] Hash(string raw) => SHA256.HashData(Encoding.UTF8.GetBytes(raw));
     static string NewRawToken() => Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));

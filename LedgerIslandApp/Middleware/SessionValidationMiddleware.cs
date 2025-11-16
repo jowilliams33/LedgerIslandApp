@@ -1,6 +1,6 @@
 ﻿using LedgerIslandApp.Services;
 
-public sealed class SessionValidationMiddleware(RequestDelegate next, ISessionService sessions)
+public sealed class SessionValidationMiddleware(RequestDelegate next, SessionService sessions)
 {
     public async Task Invoke(HttpContext ctx)
     {

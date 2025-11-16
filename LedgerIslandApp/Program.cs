@@ -34,15 +34,14 @@ builder.Services.Configure<CookiePolicyOptions>(o =>
 
 // ---------- Custom Services (CONCRETE ONLY) ----------
 builder.Services.AddSingleton<TrnOcrService>();
+
+builder.Services.AddScoped<SessionService>();
 builder.Services.AddScoped<CsvParserService>();
 builder.Services.AddScoped<DataCleaningService>();
 builder.Services.AddScoped<FileUploadService>();
 builder.Services.AddScoped<ImportService>();
 builder.Services.AddScoped<ValidationService>();
 builder.Services.AddScoped<LoggerService>();
-
-// Keep ONLY this interface — required for Google login + session logic
-
 
 // ---------- Auth (Cookies + Google) ----------
 builder.Services
@@ -63,10 +62,12 @@ builder.Services
         googleOptions.ClientSecret = cfg["Authentication:Google:ClientSecret"]!;
         googleOptions.CallbackPath = "/signin-google";
 
+        // ensure state/correlation survives external roundtrip
         googleOptions.CorrelationCookie.SameSite = SameSiteMode.None;
         googleOptions.CorrelationCookie.SecurePolicy = CookieSecurePolicy.Always;
         googleOptions.CorrelationCookie.Path = "/";
 
+        // guarantee we get the email claim
         googleOptions.Scope.Add("email");
         googleOptions.ClaimActions.MapJsonKey(System.Security.Claims.ClaimTypes.Email, "email");
 
@@ -77,7 +78,8 @@ builder.Services
             var name = ctx.Principal.FindFirst(System.Security.Claims.ClaimTypes.Name)?.Value;
             var sub = ctx.Principal.FindFirst("sub")?.Value;
 
-            var sessionService = ctx.HttpContext.RequestServices.GetRequiredService<ISessionService>();
+            var sessionService = ctx.HttpContext.RequestServices
+                .GetRequiredService<SessionService>();
             var ua = ctx.Request.Headers.UserAgent.ToString();
             var ip = ctx.HttpContext.Connection.RemoteIpAddress?.ToString();
 
@@ -86,6 +88,7 @@ builder.Services
                 invalidateOthers: true, ttl: TimeSpan.FromHours(12),
                 ct: ctx.HttpContext.RequestAborted);
 
+            // sid (HttpOnly)
             ctx.HttpContext.Response.Cookies.Append("sid", rawToken, new CookieOptions
             {
                 HttpOnly = true,
@@ -94,6 +97,7 @@ builder.Services
                 Expires = DateTimeOffset.UtcNow.AddHours(12)
             });
 
+            // ctl + sid_id (JS-readable)
             var controlSecret = ctx.HttpContext.RequestServices
                 .GetRequiredService<IConfiguration>()["Auth:ControlSecret"]!;
             var ctl = ControlKey.Make(controlSecret, sessionId);
@@ -205,18 +209,20 @@ app.MapGet("/auth/google", async ctx =>
         new AuthenticationProperties { RedirectUri = "/" });
 });
 
-// ---------- FIXED ENDPOINTS (NO INTERFACES) ----------
-app.MapPost("/imports/{batchId:guid}/post", async (Guid batchId, ImportService svc) =>
-{
-    await svc.PostToGoldenAsync(batchId);
-    return Results.Ok(new { batchId, posted = true });
-});
+// ---------- Ledger imports endpoints (concrete services) ----------
+app.MapPost("/imports/{batchId:guid}/post",
+    async (Guid batchId, ImportService importService) =>
+    {
+        await importService.PostToGoldenAsync(batchId);
+        return Results.Ok(new { batchId, posted = true });
+    });
 
-app.MapGet("/imports/{batchId:guid}/issues", async (Guid batchId, ValidationService svc) =>
-{
-    var issues = await svc.GetIssuesAsync(batchId);
-    return Results.Ok(issues);
-});
+app.MapGet("/imports/{batchId:guid}/issues",
+    async (Guid batchId, ValidationService validationService) =>
+    {
+        var issues = await validationService.GetIssuesAsync(batchId);
+        return Results.Ok(issues);
+    });
 
 app.MapPost("/logout", async ctx =>
 {
@@ -244,6 +250,6 @@ app.MapPost("/ocr/trn", async (IFormFile file, TrnOcrService ocr) =>
 .DisableAntiforgery();
 
 app.MapHub<SyncHub>("/sync");
-ControlEndpoints.MapControl(app);
+app.MapControl(); // extension method from ControlEndpoints
 
 app.Run();
