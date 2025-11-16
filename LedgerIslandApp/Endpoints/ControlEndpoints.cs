@@ -8,12 +8,9 @@ public static class ControlEndpoints
 {
     public static void MapControl(this IEndpointRouteBuilder app)
     {
-        // Example endpoint: kick other sessions
-        app.MapPost("/control/kick-others", async (HttpContext ctx, ISessionService sessions) =>
+        // Kick all other sessions for a user, keep one
+        app.MapPost("/control/kick-others", async (HttpContext ctx, SessionService sessions) =>
         {
-            // In a real implementation, you'd validate auth & payload here.
-            // For now, just parse JSON body with userId + keepSessionId.
-
             var body = await ctx.Request.ReadFromJsonAsync<KickDto>();
             if (body is null) return Results.BadRequest();
 

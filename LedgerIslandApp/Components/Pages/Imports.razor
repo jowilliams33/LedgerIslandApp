@@ -1,10 +1,12 @@
 ﻿@page "/imports"
 @using System.ComponentModel.DataAnnotations
+@using System.Text
 @using LedgerIslandApp.Models
 @using LedgerIslandApp.Services
 @using Microsoft.AspNetCore.WebUtilities
 @inject NavigationManager Nav
-
+@inject ValidationService Validation
+@inject IJSRuntime JSRuntime
 
 <PageTitle>Imports</PageTitle>
 
@@ -15,7 +17,9 @@
         <span class="text-muted small">Batch:</span>
         <code>@(CurrentBatchId == Guid.Empty ? "(none)" : CurrentBatchId)</code>
 
-        <button class="btn btn-primary btn-sm ms-3" @onclick="RunValidation" disabled="@IsBusy || CurrentBatchId == Guid.Empty">
+        <button class="btn btn-primary btn-sm ms-3"
+                @onclick="RunValidation"
+                disabled="@IsBusy || CurrentBatchId == Guid.Empty">
             @if (IsBusy)
             {
                 <span class="spinner-border spinner-border-sm me-2"></span>
@@ -23,13 +27,17 @@
             Run Validation
         </button>
 
-        <button class="btn btn-success btn-sm" @onclick="PostNow" disabled="@IsBusy || CurrentBatchId == Guid.Empty">
+        <button class="btn btn-success btn-sm"
+                @onclick="PostNow"
+                disabled="@IsBusy || CurrentBatchId == Guid.Empty">
             Post to Golden
         </button>
 
         @if (Issues is not null)
         {
-            <button class="btn btn-outline-secondary btn-sm" @onclick="DownloadIssues" disabled="@((Issues?.Count ?? 0) == 0)">
+            <button class="btn btn-outline-secondary btn-sm"
+                    @onclick="DownloadIssues"
+                    disabled="@((Issues?.Count ?? 0) == 0)">
                 Download Issues (CSV)
             </button>
             <span class="ms-2 small text-muted">(@Issues.Count issues)</span>
@@ -41,7 +49,9 @@
         <div class="alert alert-info py-2">
             <strong>Last Post:</strong>
             @LastPost.ApprovedBy
-            <span class="text-muted"> @LastPost.PostedAtUtc.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")</span>
+            <span class="text-muted">
+                @LastPost.PostedAtUtc.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+            </span>
             · run+@LastPost.RunRows · total=@LastPost.TotalRows
         </div>
     }
@@ -52,6 +62,7 @@
         <div class="alert @(balanced ? "alert-success" : "alert-danger") mt-3 mb-2">
             <strong>Totals:</strong>
             Debit = @Totals.TotalDebit:N2 · Credit = @Totals.TotalCredit:N2 · Rows = @Totals.RowCount
+
             @if (!balanced)
             {
                 <span class="ms-2 badge bg-danger">
@@ -123,6 +134,7 @@
     protected override async Task OnInitializedAsync()
     {
         var uri = Nav.ToAbsoluteUri(Nav.Uri);
+
         if (QueryHelpers.ParseQuery(uri.Query).TryGetValue("batch", out var raw)
             && Guid.TryParse(raw, out var id))
         {
@@ -135,11 +147,13 @@
     private async Task RunValidation()
     {
         if (CurrentBatchId == Guid.Empty) return;
-        IsBusy = true; StateHasChanged();
+
+        IsBusy = true;
+        StateHasChanged();
 
         try
         {
-            Issues = (await Validation.GetIssuesAsync(CurrentBatchId)).ToList();
+            Issues = (await Validation.GetIssuesByBatchAsync(CurrentBatchId)).ToList();
             Totals = await Validation.GetTotalsAsync(CurrentBatchId);
             LastPost = await Validation.GetLastPostAsync(CurrentBatchId);
         }
@@ -149,21 +163,25 @@
         }
         finally
         {
-            IsBusy = false; StateHasChanged();
+            IsBusy = false;
+            StateHasChanged();
         }
     }
 
     private async Task PostNow()
     {
         if (CurrentBatchId == Guid.Empty) return;
-        IsBusy = true; StateHasChanged();
+
+        IsBusy = true;
+        StateHasChanged();
 
         try
         {
             var rows = await Validation.PostToGoldenAsync(CurrentBatchId, "system");
             Totals = await Validation.GetTotalsAsync(CurrentBatchId);
-            Issues = (await Validation.GetIssuesAsync(CurrentBatchId)).ToList();
+            Issues = (await Validation.GetIssuesByBatchAsync(CurrentBatchId)).ToList();
             LastPost = await Validation.GetLastPostAsync(CurrentBatchId);
+
             Console.WriteLine($"Posted {rows} rows.");
         }
         catch (Exception ex)
@@ -172,7 +190,8 @@
         }
         finally
         {
-            IsBusy = false; StateHasChanged();
+            IsBusy = false;
+            StateHasChanged();
         }
     }
 
@@ -182,12 +201,14 @@
 
         var csv = new StringBuilder();
         csv.AppendLine("CleanRowId,Severity,Code,Field,Message");
+
         foreach (var i in Issues)
             csv.AppendLine($"{i.CleanRowId},{i.Severity},{i.Code},{i.Field},{i.Message}");
 
         var bytes = Encoding.UTF8.GetBytes(csv.ToString());
         var base64 = Convert.ToBase64String(bytes);
         var url = $"data:text/csv;base64,{base64}";
+
         await JSRuntime.InvokeVoidAsync("window.open", url, "_blank");
     }
 

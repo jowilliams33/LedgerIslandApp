@@ -77,6 +77,10 @@ namespace LedgerIslandApp.Services
             return result;
         }
 
+        // NEW: wrapper used by Imports.razor
+        public Task<IReadOnlyList<RowIssueDto>> GetIssuesByBatchAsync(Guid batchId)
+            => GetIssuesAsync(batchId);
+
         // ----------------------------------------
         // PUBLIC: batch totals
         // ----------------------------------------
